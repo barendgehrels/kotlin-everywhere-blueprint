@@ -71,6 +71,9 @@ Inside each module, there are packages per **feature** (`settings`, `usage`,
 - **`app/shared` and `core` are KMP libraries** with AGP 9's
   `com.android.kotlin.multiplatform.library` plugin (`android { … }` inside `kotlin { … }`).
   The Android app itself is `app/androidApp`, with `com.android.application`.
+- **`app/shared` keeps `binaries.executable()` on `js` and `wasmJs`,** as the wizard made it,
+  although it is a library: Compose's web tests need the bundle (CMP-4906), and find no tests
+  without it.
 - **No compiler flags.** On Kotlin 2.4, the explicit backing field
   (`val x: StateFlow<T>` with `field = MutableStateFlow(...)`) needs no flag.
 
@@ -89,6 +92,7 @@ All in `gradle/libs.versions.toml`. The versions that were last checked are unde
 | `app/shared` per platform | Ktor engines: `ktor-client-okhttp` (Android), `-darwin` (iOS), `-java` (desktop), `-js` (both web targets) | the HTTP calls |
 | | `androidx.datastore:datastore-preferences` in `dataStoreMain` (Android, iOS, desktop) | local storage |
 | | `kotlin-wrappers` `kotlin-browser` in `webMain` | `localStorage`, and the page |
+| `app/webApp` | `kotlin-wrappers` `kotlin-browser` | the URL query, for the startup options |
 | `service` | `kotlinx-coroutines-core`, `kotlinx-serialization-json`, `kotlin-wrappers` `kotlin-browser` | promises, JSON, and `fetch`, `Request`, `Response` |
 | tests | `kotlin-test` in `commonTest`; `kotlinx-coroutines-test` in `app/shared` | everywhere; the view model tests |
 
@@ -155,6 +159,9 @@ minify = true
   change with it.
 - **`@JsExport`** keeps the name `handleRequest` reachable, also with `minify = true`. The
   package (`org.example.myapp`) is the path in `index.js`.
+- **`Router.kt` is in the root package** (`org.example.myapp`), not in `foundation` with the
+  rest of the router's helpers: exported from there, the path would be
+  `org.example.myapp.foundation.handleRequest`.
 - **No `main()`.** The module only exports `handleRequest`.
 - **The file:** `:service:build` writes
   `service/build/compileSync/js/main/productionExecutable/kotlin/<outputModuleName>.js`, next
@@ -178,30 +185,33 @@ The app knows its service's URL and its version at compile time. A small Gradle 
 ```kotlin
 // app/shared/build.gradle.kts
 // secret.properties, in the root, in .gitignore: cloud_service_url=https://...
-val localProperties = Properties().apply {
-    val file = rootProject.file("secret.properties")
-    if (!file.exists()) throw GradleException("${file} not found")
-    file.inputStream().use { load(it) }
-}
+// Read only when the property is not given; null when it is missing or cannot be read.
+fun secretProperty(name: String): String? = runCatching {
+    Properties().apply { rootProject.file("secret.properties").inputStream().use { load(it) } }
+        .getProperty(name)
+}.getOrNull()
 
 val generatedFolder = "generated/kotlin/config"
-val cloudServiceUrl = providers.gradleProperty("cloud_service_url").orNull   // -P wins
-    ?: localProperties.getProperty("cloud_service_url")
-    ?: throw GradleException("cloud_service_url is missing in secret.properties")
+val cloudServiceUrl: String? = providers.gradleProperty("cloud_service_url").orNull   // -P wins
+    ?: secretProperty("cloud_service_url")
 
 val generateConfig = tasks.register("generateConfig") {
+    val url = cloudServiceUrl
     val content = """
         package generated
 
         internal object AppConfig {
-            const val CLOUD_SERVICE_URL: String = "$cloudServiceUrl"
+            const val CLOUD_SERVICE_URL: String = "$url"
             const val VERSION_NAME: String = "$versionName"
         }
     """.trimIndent()
     val file = layout.buildDirectory.file("$generatedFolder/AppConfig.kt")
     inputs.property("content", content)
     outputs.file(file)
-    doLast { file.get().asFile.apply { parentFile.mkdirs(); writeText(content) } }
+    doLast {
+        if (url == null) throw GradleException("cloud_service_url: not in secret.properties, and no -P")
+        file.get().asFile.apply { parentFile.mkdirs(); writeText(content) }
+    }
 }
 
 kotlin.sourceSets.commonMain { kotlin.srcDir(layout.buildDirectory.dir(generatedFolder)) }
@@ -209,10 +219,21 @@ tasks.withType<KotlinCompilationTask<*>>().configureEach { dependsOn(generateCon
 ```
 
 - **No plugin** (no BuildKonfig): a task of a few lines, which only runs when the content changed.
+- **`-P` first, the file second, and a missing URL fails only this task.** So a build with
+  `-Pcloud_service_url` needs no `secret.properties` (CI, a sandboxed agent), and a build of
+  another module (`:service:build`) never needs either. Plain values, not a chain of
+  `Provider.orElse(provider { … })`: that evaluates the fallback and breaks the configuration
+  cache.
 - **`Configuration.csUrl`** is `reachableUrl(AppConfig.CLOUD_SERVICE_URL)`.
 - **`-Pcloud_service_url=http://localhost:8787`** runs the app against a local `wrangler dev`.
+  The native apps refuse plain http unless they are told:
+  - **Android:** the `INTERNET` permission (which every Android app with a service needs), and a
+    `networkSecurityConfig` that allows cleartext to `10.0.2.2` and `localhost` only.
+  - **iOS:** `NSAppTransportSecurity` → `NSAllowsLocalNetworking` in `Info.plist`.
 - **iOS needs its version below Kotlin too** (in `Info.plist`): a second task writes it into an
-  `.xcconfig` for Xcode.
+  `.xcconfig` for Xcode, which the wizard's `Config.xcconfig` includes with `#include?
+  "Version.xcconfig"`. Xcode reads the `.xcconfig` files before its Gradle build phase runs, so a
+  new version shows one build later. Keep the generated file in git, so a fresh clone builds.
 
 ## Principles
 
@@ -360,17 +381,30 @@ private fun expiresSoon(idToken: String): Boolean {
 interface UsageGateway { suspend fun usage(): Result<Usage> }
 
 class CloudUsageGateway(private val session: SessionStore) : UsageGateway {
-    override suspend fun usage(): Result<Usage> {
-        val idToken = session.validIdToken() ?: return Result.failure(NotLoggedInException())
-        return NetworkClient.postJson<UsageResponse>("usage", idToken = idToken).map { it.usage }
+    override suspend fun usage(): Result<Usage> = session.withIdToken { idToken ->
+        NetworkClient.postJson<Unit, UsageResponse>("usage", idToken = idToken).map { it.usage }
     }
+}
+
+// SessionStore: the token for a call, and the one place where a call's answer logs out
+suspend fun <T> withIdToken(call: suspend (idToken: String) -> Result<T>): Result<T> {
+    val idToken = validIdToken() ?: return Result.failure(NotLoggedInException())
+    val used = session.value
+    return call(idToken).onFailure { if (isSessionExpired(it)) expire(used) }
 }
 ```
 
 - **One interface per feature.** The `Cloud…` implementation takes the `SessionStore` for the token.
 - **Return values:** the gateway returns `Result<T>` with app types; it maps the transfer types itself.
 - **Not its job:** it never touches view models, stores (other than reading the token) or UI.
-- **`NetworkClient.postJson<Res>(path, request?, idToken?)`** is the one generic call.
+- **`session.withIdToken { }`** gives the call a valid token, and fails with
+  `NotLoggedInException` without a session. When the service answers `SESSION_EXPIRED`, it logs
+  the user out, unless the session changed meanwhile (`expire(used)`). So a gateway still only
+  reads the token, and every call logs out the same way.
+- **`NetworkClient.postJson<Req, Res>(path, request?, idToken?)`** is the one generic call.
+  - Both types are reified: JS and Wasm have no reflection, so `request: Any?` cannot be
+    serialized there. `Req` is `Unit` without a body; `Res` is `Unit` for an answer without
+    content (any body is accepted).
   - It sends a JSON body with `bearerAuth`.
   - It decodes `Res` on 2xx.
   - Otherwise it decodes core's `ErrorBody` into `ApiException(code, message, status)`.
@@ -482,14 +516,22 @@ interface KeyValueStore {
 
 expect fun platformStore(): KeyValueStore
 
-object LocalStorage {
-    private val store: KeyValueStore by lazy { platformStore() }
+class LocalStorage(private val store: KeyValueStore) {
     suspend fun <T> get(entry: StorageEntry<T>): T? = ...  // logs an unreadable store; guards deserializing
     suspend fun <T> set(entry: StorageEntry<T>, value: T) = store.set(entry.name, entry.serialize(value))
 }
+
+// AppContainer
+val localStorage = LocalStorage(platformStore())
 ```
 
 - **The entries are typed,** all in one `StorageEntries` object.
+- **`LocalStorage` is a class, made once in the `AppContainer`,** and handed to the stores and
+  view models that persist something. Not an `object` with a lazy `platformStore()`: tests would
+  then write to the real store (on the desktop, in the user's home folder). Tests use a
+  `MemoryKeyValueStore` of a few lines.
+- **Android's store needs a `Context`** for its path. `MainActivity` hands the application
+  context to the platform code once, before `App()` (`initAndroidPlatform(applicationContext)`).
 - **Prefer an interface plus an `expect fun` over an `expect class` or `expect object`.**
   Expect/actual classes are still Beta, and need `-Xexpect-actual-classes`. With this design no
   project needs the flag.
@@ -502,7 +544,7 @@ object LocalStorage {
   kotlin {
       applyDefaultHierarchyTemplate()   // explicitly, because we add a source set of our own
       sourceSets {
-          val dataStoreMain by creating {
+          val dataStoreMain = create("dataStoreMain") {   // `by creating` is deprecated in Gradle 9.6
               dependsOn(commonMain.get())
               dependencies { implementation(libs.androidx.datastore.preferences) }
           }
@@ -579,6 +621,9 @@ would only hide the same hack in harder-to-read code.
 ### Foundation helpers
 
 - **`Platform`:** expect/actual for logging, the version name and `reachableUrl(url)`. On Android, `localhost` becomes `10.0.2.2`, so the emulator reaches the development machine.
+  - **iOS logs with `NSLog(message.replace("%", "%%"))`,** never `NSLog("%@", message)`.
+    Kotlin/Native passes a `String` in a C vararg list as a C string, not as an `NSString`, so
+    `%@` crashes, at the first line logged (in a network app often Ktor's first request).
 - **`Configuration.csUrl`:** the service URL from the generated config, through `reachableUrl`.
 - **`isPortraitWindow()`:** one function for every layout decision, so the navigation and the screens switch at the same moment.
 - **Navigation:** a bar in portrait and a rail in landscape. The choice is by orientation, not by width: on a phone in landscape, height is what is scarce.
@@ -735,7 +780,7 @@ suspend fun handleX(call: Call): Response {
 ```
 
 - **Errors:** `throw ServiceException(code, message, status)`. There are no sealed `Allowed`/`Denied` or `Success`/`Failure` types to unwrap.
-- **The environment:** `Env` properties are all nullable. `requireEnv(env.X, ENV_X)` and `requireDb(env)` throw a 500 with the environment code; the variable's name goes to the log, not to the user.
+- **The environment:** `Env` properties are all nullable. `requireEnv(env.X, ENV_X)` throws a 500 and `requireDb(env)` a 503 (a binding, as a missing limiter), both with the environment code; the variable's name goes to the log, not to the user.
 - **Input:** every text that goes to a provider or the database has a maximum length, and
   every code (a language, a time) a fixed form. Check them before anything costs money.
 - **Authorization:**
@@ -750,6 +795,9 @@ suspend fun handleX(call: Call): Response {
       session expired) is the user's problem: a 400 with a specific code.
     - Too many attempts is a 429: nothing is wrong with the account.
     - Any other answer, and a 5xx, is Firebase's problem: a 502.
+  - **One `Json` for the service, with `encodeDefaults = true`** (and `ignoreUnknownKeys`,
+    `explicitNulls = false`). Firebase needs `returnSecureToken: true`, a field with a default,
+    and kotlinx.serialization leaves defaults out otherwise: the answer then has no tokens.
 - **Bookkeeping:** use `afterResponse(call, what) { ... }`, which wraps `ctx.waitUntil`. The user doesn't wait for it, and a failure is logged, not returned.
 - **Firebase signing keys:** cache them for their `Cache-Control` max-age, and the imported keys per `kid`. Refetch for an unknown `kid`, at most once a minute.
 - **Logs:** what a user wrote stays out of the logs, except with a debug switch (`DEBUG_AI`)
@@ -766,7 +814,7 @@ Toolkit, `identitytoolkit.googleapis.com` and `securetoken.googleapis.com`) and 
 | `/login` | `LoginRequest(email, password)` | `AccountResponse` | `accounts:signInWithPassword` | `LOGIN_LIMITER` per IP; a wrong password is `LOGIN` |
 | `/register` | `RegisterRequest(email, password)` (a guest's, optional) | `AccountResponse` | `accounts:signUp`, or `accounts:update` for a guest | `ACCOUNT_LIMITER` per IP |
 | `/refresh_token` | `RefreshTokenRequest(refreshToken)` | `AccountResponse` | `securetoken` `token` | an invalid refresh token is `SESSION_EXPIRED` |
-| `/verify_email` | – (the user's) | – | `accounts:sendOobCode`, `VERIFY_EMAIL` | with `continueUrl` = `CONFIRM_URL` |
+| `/verify_email` | – (the user's) | – | `accounts:sendOobCode`, `VERIFY_EMAIL` | `ACCOUNT_LIMITER` per IP; with `continueUrl` = `CONFIRM_URL` |
 | `/password_reset` | `PasswordResetRequest(email)` | – | `accounts:sendOobCode`, `PASSWORD_RESET` | `ACCOUNT_LIMITER` per IP; an unknown address is `RESET_PASSWORD` |
 | `/change_password` | `ChangePasswordRequest(idToken, password)` | `AccountResponse` | `accounts:update` | new tokens: the old ones stop working |
 | `/confirm` | GET, from the email's link | a small HTML page | – | "Your email address is verified; go back to the app" |
@@ -788,6 +836,22 @@ data class AccountResponse(
   and for a guest `isGuest` and `name`), in local storage.
 - **Each of these handlers also updates the `users` row** (email, verified, `synced_at`), or
   makes it for a new registered user.
+- **The password reset has no `continueUrl`:** the `/confirm` page says the address is
+  verified, which is wrong after a reset. Firebase's own page then ends the flow.
+- **Firebase's error messages, per endpoint.** Firebase answers a 400 with a message such as
+  `EMAIL_EXISTS` or `WEAK_PASSWORD : Password should be at least 6 characters` (compare the part
+  before ` : `):
+
+  | Endpoint | Firebase message | Our code |
+  |---|---|---|
+  | `/login` | `INVALID_LOGIN_CREDENTIALS`, `EMAIL_NOT_FOUND`, `INVALID_PASSWORD`, `USER_DISABLED`, `INVALID_EMAIL` | `LOGIN` |
+  | `/register` | `EMAIL_EXISTS`, `INVALID_EMAIL`, `WEAK_PASSWORD`, `CREDENTIAL_TOO_OLD_LOGIN_AGAIN` | `REGISTER` |
+  | `/refresh_token` | `TOKEN_EXPIRED`, `USER_DISABLED`, `USER_NOT_FOUND`, `INVALID_REFRESH_TOKEN` | `SESSION_EXPIRED` (400) |
+  | `/change_password` | `WEAK_PASSWORD`, `CREDENTIAL_TOO_OLD_LOGIN_AGAIN` | `CHANGE_PASSWORD` |
+  | | `INVALID_ID_TOKEN`, `TOKEN_EXPIRED` | `SESSION_EXPIRED` (401) |
+  | `/password_reset` | `EMAIL_NOT_FOUND` | `RESET_PASSWORD` |
+  | all | `TOO_MANY_ATTEMPTS_TRY_LATER`, or an HTTP 429 | `TOO_MANY_REQUESTS` (429) |
+  | all | anything else | `AUTHENTICATION` (502) |
 - **Firebase in the console, once:** a project, with the **Email/Password** sign-in provider
   on (Authentication → Sign-in method). Its Web API key is `FIREBASE_API_KEY`, its project id
   `FIREBASE_PROJECT_ID` (both vars: they are not secret). The worker checks tokens against
@@ -821,11 +885,17 @@ external interface Env {
 - **A var is text.** Keep the quotes in `wrangler.toml` (`ANTHROPIC_MAX_TOKENS = "4096"`), and
   convert in Kotlin (`toIntOrNull()`, with a default).
 - **Missing is a 500 or 503, never a silent default for what matters:** `requireEnv(env.X,
-  "X")` for a var or secret, `requireDb(env)` for the database. A limiter that is missing is a
-  503 too.
+  "X")` for a var or secret is a 500; `requireDb(env)` for the database, and a missing limiter,
+  are a 503, as every missing binding.
 - **Bindings** are `external interface`s of our own (`cloudflare/D1.kt`, `RateLimiter`), with
   only the methods we use.
 - **`wrangler.toml` explains each var** in a comment: what it is, its unit, and its default.
+- **In a public repository, `wrangler.toml` stays out of git.** Its vars are not secret, but
+  together with the worker names, the database id and the account's `workers.dev` subdomain they
+  say where the service runs, and the random suffix of the name is there to hide that. Commit a
+  `wrangler.example.toml` with `<placeholders>` instead, keep the real `wrangler.toml` in
+  `.gitignore` (as `secret.properties`), and let the deploy script stop when it is missing. A
+  change of a var or a limiter goes into the example too. The web app's `wrangler.toml` the same.
 - **`ALLOWED_ORIGIN`** lists the web app's origins (`https://myapp.example.com`, and its
   `workers.dev` address while that is used). The router uses it for CORS, and the human check
   for the hostnames it accepts.
@@ -875,7 +945,8 @@ suspend fun callClaude(env: Env, systemPrompt: String, userPrompt: String): AiRe
   "Return ONLY a raw JSON object, no markdown". The service then decodes it into a
   `@Serializable` class of its own (`decodeAiJson`): it takes the last complete `{…}` block of
   the answer that decodes, because a model sometimes adds a code fence or a remark anyway. No
-  valid block is a 502 (`PROVIDER`), with the answer in the log. For a shape that must never
+  valid block is a 502 (`PROVIDER`). The log gets the answer's length, and the answer itself
+  only with `DEBUG_AI`: a model often repeats the user's text. For a shape that must never
   fail, tool use with an input schema is stricter; the prompt is simpler, and was enough so far.
 - **Check what comes back** as you check user input: a latitude between −90 and 90, a word that
   is really in the text. The model's answer is data from outside.
@@ -1046,7 +1117,10 @@ What a new app has from the start, all with `kotlin-test`:
   gateway interface and returns a fixed `Result`, so a test sends an action and checks the
   UiState and the `MessageStore`: a success, a failure, and an overtaken request. Use
   `kotlinx-coroutines-test` (`runTest`, and `Dispatchers.setMain` with a test dispatcher,
-  because `viewModelScope` uses the main dispatcher).
+  because `viewModelScope` uses the main dispatcher). Give a store a scope of its own on the
+  test's scheduler (`CoroutineScope(StandardTestDispatcher(testScheduler))`), not
+  `backgroundScope`: `advanceUntilIdle()` doesn't run the work of `backgroundScope`, so the
+  store's saves in the background would never happen.
 - **Pure logic in the app** (a comparison, a parser, a WAV header) is a plain function, with
   its own unit test.
 - **The service:** what a handler decides is a plain function in its own file (a check, a
@@ -1073,6 +1147,14 @@ The versions of the reference implementation in November 2026:
 | kotlin-wrappers | 2026.10.4 |
 | Android | compileSdk 37, targetSdk 36, minSdk 24; JVM toolchain 11 |
 
+The example in this repository ([example_slippy_map_tiles](example_slippy_map_tiles)) keeps
+what the wizard gave in November 2026, and builds with it as the blueprint describes: AGP 9.5.2,
+Gradle 9.6.0, Ktor 3.6.1, kotlin-wrappers 2026.11.2, targetSdk 37; the rest as above.
+
+One version is not free: the desktop package (`nativeDistributions.packageVersion`) needs a
+major version of at least 1 for a macOS DMG. An app at 0.x keeps `1.0.0` there; the app itself
+shows its own version.
+
 The step to Kotlin 2.4.20, Compose Multiplatform 1.12, AGP 9.4 and kotlin-wrappers 2026.9.3
 (October 2026) required these changes:
 
@@ -1085,9 +1167,12 @@ The step to Kotlin 2.4.20, Compose Multiplatform 1.12, AGP 9.4 and kotlin-wrappe
   ```kotlin
   return fetch(url, RequestInit(...)).value
   ```
-- **npm instead of Yarn.** Kotlin 2.4 uses npm for Kotlin/JS and Wasm, so the lock file in
-  `kotlin-js-store` is `package-lock.json`. Delete the Yarn-era `build/js`, `build/wasm` and
-  `kotlin-js-store` once; the next install writes the new lock files.
+- **npm or Yarn.** The reference implementation went from Yarn to npm with Kotlin 2.4 (the lock
+  file in `kotlin-js-store` became `package-lock.json`, after deleting the Yarn-era
+  `build/js`, `build/wasm` and `kotlin-js-store` once). A new wizard project on Kotlin 2.4.21
+  still uses Yarn (`kotlin-js-store/yarn.lock`, and `wasm/yarn.lock`). Either works. With Yarn,
+  a new JS dependency stops the build with "Lock file was changed": run
+  `./gradlew kotlinUpgradeYarnLock`, and `kotlinWasmUpgradeYarnLock` for Wasm, separately.
 - **Deprecated internals disappear,** for example `SystemTheme` and `LocalSystemTheme` (see
   dark mode).
 

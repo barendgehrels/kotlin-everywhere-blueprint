@@ -179,13 +179,20 @@ token with the name to `/guest`.
 
 The page does the work in JavaScript, and the Kotlin side polls it:
 
-- **`index.html` has an empty `<div id="turnstile">`** below the app, and two
+- **`index.html` has an empty `<div id="human-check">`** below the app. Not
+  `id="turnstile"`: the browser makes every element id a global, so
+  `window.turnstile` would be that div before Turnstile's script has loaded
+  ("`turnstile.render` is not a function"). The page also checks
+  `typeof window.turnstile?.render === "function"`, not just `window.turnstile`.
+  It has two
   functions:
   - `requestHumanCheck()` loads Turnstile's script the first time
     (`api.js?render=explicit&onload=...`), so a visitor who never taps Guest
     never loads it. Then it renders the widget with
     `appearance: "interaction-only"`, which is invisible unless the visitor
-    has to tick the box.
+    has to tick the box. A token is valid once, so for every later request it
+    calls `turnstile.reset()` on the widget it rendered before, instead of
+    rendering a second one.
   - `humanCheckResult()` returns the token, or `null` while there is none.
     It returns `""` without a site key or when Turnstile failed.
 - **The site key gets into the page at build time.** `app/webApp/build.gradle.kts`
@@ -194,8 +201,12 @@ The page does the work in JavaScript, and the Kotlin side polls it:
 - **Kotlin declares both functions `external`**, calls
   `requestHumanCheck()`, and then polls `humanCheckResult()` every 200 ms,
   for at most 3 minutes.
-- **The `#turnstile` div is centered** with a little CSS
+- **The `#human-check` div is centered** with a little CSS
   (`display: flex; justify-content: center`).
+- **The app gets a container of its own.** `ComposeViewport` fills the whole
+  `body` by default, and covers the `#human-check` div and the APK footer. So the
+  page has a `<div id="composeApplication">` that takes the rest of the height
+  (the body a flex column), and `main()` passes its id as `viewportContainerId`.
 
 ### 3.2 Android and iOS: the worker's page in a web view
 
@@ -243,7 +254,10 @@ view inside a small dialog.
 - `addJavascriptInterface(bridge, "HumanCheck")`;
 - `destroy()` in `onRelease`;
 - in a debug build, `WebView.setWebContentsDebuggingEnabled(true)`, so the
-  page can be inspected from the computer in `chrome://inspect`.
+  page can be inspected from the computer in `chrome://inspect`. A KMP library
+  has no `BuildConfig`: check `ApplicationInfo.FLAG_DEBUGGABLE` instead;
+- the bridge's methods are called on a background thread: post to the main
+  thread before completing the request or changing the dialog's height.
 
 **iOS (`HumanCheck.ios.kt`):**
 
@@ -300,7 +314,8 @@ check and without our limits. The token is valid, but the user isn't ours.
    taken for an email address (`isGuestNameValid` in core, shared with the app). This is
    checked before the human check, so a wrong name doesn't use up a token.
 3. **At most `GUEST_DAILY_MAX` new guests a day** in all (a var, for example 200), counted
-   in the `users` table: a 429. The limiter is per IP address, which a script can change;
+   in the `users` table: a 429 (`TOO_MANY_REQUESTS`; an index on
+   `users (is_guest, created_at)` keeps the count cheap). The limiter is per IP address, which a script can change;
    this is the ceiling of what guests can cost in a day.
 4. **`requireHuman`** (see 2).
 5. **Firebase `signUp`**, then the `users` row. The answer is the usual
@@ -332,7 +347,10 @@ of use. Two kinds:
   `GUEST_TILES_PER_DAY` (a var, default 2000), then a 429
   (`GUEST_QUOTA`). It is counted in memory per isolate, starting from
   what the database had, so a little more gets through, never much, at one
-  database read per guest a day. Its table:
+  database read per guest a day. Each delivered tile adds one in the database
+  after the response (`afterResponse`, `ON CONFLICT … DO UPDATE SET count =
+  count + 1`), so the counts of several isolates add up; a tile that failed
+  upstream doesn't count. Its table:
 
   ```sql
   CREATE TABLE IF NOT EXISTS usage_days (
@@ -387,7 +405,12 @@ stays, and with it the `users` row and everything the guest made.
   anonymous user, so the uid stays the same.
 - **Without one,** it calls `accounts:signUp` as for any new user.
 - **Then, as at login,** it updates the `users` row: email, verified, and
-  `is_guest = 0`. A new account gets the starter grant now.
+  `is_guest = 0`. From now on the registered user's budgets apply
+  (`WEEKLY_BUDGET_TICKS`, `TOTAL_BUDGET_TICKS`), with what the guest used counted
+  against them; there is no starter grant.
+- **A token on `/register` must be valid.** An invalid or expired one is a 401,
+  not a plain new account: else a guest would silently lose what they made. A
+  registered user's token there is ignored, and it is a plain `signUp`.
 - **The app then asks for the verification email** (`/verify_email`), as
   after any registration.
 
@@ -422,7 +445,7 @@ simple = { limit = 5, period = 60 }
 |---|---|---|---|
 | `GUEST_LIMITER` | IP address | 5 a minute | new guests; a script stops here, even with the human check passed |
 | `LOGIN_LIMITER` | IP address | 10 a minute | `/login`: guessing passwords |
-| `ACCOUNT_LIMITER` | IP address | 3 a minute | `/register` and the password reset: each sends an email |
+| `ACCOUNT_LIMITER` | IP address | 3 a minute | `/register`, `/verify_email` and the password reset: each sends an email |
 | `USER_LIMITER` | user | 20 per 10 seconds | every call that costs money, on top of the budget |
 | one per kind of data | user | high, such as 600 a minute | data a script could copy, a guest's too |
 
@@ -512,7 +535,7 @@ with the same explanation below it.
   - `KnownGuests` for logging out and resuming;
   - the register flow with the guest's token, refreshed first.
 - [ ] **Web page:**
-  - the `#turnstile` div and the two functions;
+  - the `#human-check` div and the two functions;
   - `@TURNSTILE_SITE_KEY@` replaced at build time;
   - the `android.json` footer.
 - [ ] **Deploy:**
