@@ -1,0 +1,9 @@
+# The web app: its own worker, with only static assets. Copy this file to wrangler.toml (in
+# .gitignore) and fill in the suffix; see SETUP.md. Build first:
+#   ./gradlew :app:webApp:wasmJsBrowserDistribution
+# then, in app/webApp: npx wrangler deploy
+name = "slippy-web-<random-suffix>"   # a random suffix: the workers.dev address is public
+compatibility_date = "2026-06-16"
+
+[assets]
+directory = "build/dist/wasmJs/productionExecutable"

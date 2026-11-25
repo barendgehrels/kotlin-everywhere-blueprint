@@ -1,0 +1,76 @@
+# The Slippy service: a Kotlin/JS worker. Copy this file to wrangler.toml (in .gitignore) and
+# fill in the <placeholders>; see SETUP.md. Build first with ./gradlew :service:build
+#   npx wrangler dev        (local, with service/.env for the secrets)
+#   npx wrangler deploy
+name = "slippy-service-<random-suffix>"   # a random suffix: the workers.dev address is public
+main = "index.js"
+compatibility_date = "2026-06-16"
+minify = true                # less code to parse at each cold start
+upload_source_maps = true    # readable stack traces in Cloudflare's logs despite minify
+
+[vars]
+# The web app's origins, comma-separated, for CORS and the human check's hostnames.
+# http://localhost:8080 (the local web app) is always allowed.
+
+ALLOWED_ORIGIN = "https://slippy-web-<random-suffix>.<account>.workers.dev"
+
+FIREBASE_PROJECT_ID = "<firebase-project-id>"
+
+# The page the verification email's link ends on: this worker's /confirm. Replace <account>.
+CONFIRM_URL = "https://slippy-service-<random-suffix>.<account>.workers.dev/confirm"
+# The Claude model of /geocode; it needs a rate in model_rates (migrations), else it counts at the highest.
+ANTHROPIC_MODEL = "claude-haiku-5-5"
+# The ceiling of Claude's answer, in tokens (default 1024). A geocode answer needs about 50.
+ANTHROPIC_MAX_TOKENS = "256"
+# The weekly budget of a registered user, in ticks (1 tick = $0.0001), since Monday 00:00 UTC.
+# A user's own users.weekly_budget_ticks overrides it.
+WEEKLY_BUDGET_TICKS = "2000"
+# The total budget of a registered user, in ticks; users.total_budget_ticks overrides it.
+TOTAL_BUDGET_TICKS = "20000"
+# The total budget of a guest, in ticks, and all it gets. "0": paid calls for registered users only.
+GUEST_TOTAL_BUDGET_TICKS = "0"
+# New guests a day, in all (UTC day): the ceiling of what guests can cost. Then a 429.
+GUEST_DAILY_MAX = "200"
+# Map tiles a guest may load a day (UTC day). Then a 429 (GUEST_QUOTA).
+GUEST_TILES_PER_DAY = "2000"
+# Turnstile's site key (public), for the page /human_check of the native apps. Replace it.
+# Empty: the page sends "" at once, which only a local wrangler dev accepts.
+TURNSTILE_SITE_KEY = "<turnstile-site-key>"
+# "true" logs the user's text and the AI's answers. Keep "false" when deployed.
+DEBUG_AI = "false"
+
+# Secrets (npx wrangler secret put NAME; locally in service/.env):
+#   FIREBASE_API_KEY (public, but kept with the other keys), MAPTILER_API_KEY, ANTHROPIC_API_KEY,
+#   TURNSTILE_SECRET_KEY
+
+[[d1_databases]]
+binding = "DB"
+database_name = "slippy"
+database_id = "<d1-database-id>"   # npx wrangler d1 create slippy
+migrations_dir = "migrations"
+
+# Rate limits; the period can only be 10 or 60 seconds. The namespace ids are unique in the account.
+[[ratelimits]]
+name = "GUEST_LIMITER"       # new guests per IP address
+namespace_id = "1001"
+simple = { limit = 5, period = 60 }
+
+[[ratelimits]]
+name = "LOGIN_LIMITER"       # /login per IP address: guessing passwords
+namespace_id = "1002"
+simple = { limit = 10, period = 60 }
+
+[[ratelimits]]
+name = "ACCOUNT_LIMITER"     # /register, /password_reset, /verify_email per IP address: each sends an email
+namespace_id = "1003"
+simple = { limit = 3, period = 60 }
+
+[[ratelimits]]
+name = "USER_LIMITER"        # per user, every call that costs money
+namespace_id = "1004"
+simple = { limit = 20, period = 10 }
+
+[[ratelimits]]
+name = "TILE_LIMITER"        # map tiles per user, a guest's too
+namespace_id = "1005"
+simple = { limit = 600, period = 60 }

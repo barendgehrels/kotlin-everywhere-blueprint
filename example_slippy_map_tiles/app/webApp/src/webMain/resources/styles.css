@@ -1,0 +1,30 @@
+html, body {
+    width: 100%;
+    height: 100%;
+    margin: 0;
+    padding: 0;
+    overflow: hidden;
+}
+
+body {
+    display: flex;
+    flex-direction: column;
+}
+
+/* The app takes what the human check and the footer leave */
+#composeApplication {
+    flex: 1;
+    min-height: 0;
+    position: relative;
+}
+
+#human-check {
+    display: flex;
+    justify-content: center;
+}
+
+#android {
+    font: 13px sans-serif;
+    text-align: center;
+    padding: 4px;
+}

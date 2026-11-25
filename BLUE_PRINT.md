@@ -1129,6 +1129,35 @@ What a new app has from the start, all with `kotlin-test`:
   `wrangler dev` or the deployed service, not by unit tests.
 - **Every test names what it shows** (`hugeChunkIsNoRecording`, `lettersAndDigitsOnly`),
   with a one-line comment when the name isn't enough.
+- **Every test task says how many tests it ran.** Gradle prints only failed tests, so a
+  successful run looks the same as one that ran nothing. The root `build.gradle.kts` adds
+  one line per test task (such as `:core:jvmTest: 19 tests, 0 failed, 0 skipped`), and the
+  whole stack trace of a failure. `AbstractTestTask` covers every platform, from the JVM and
+  Android to Kotlin/Native, JS and Wasm:
+
+  ```kotlin
+  subprojects {
+      tasks.withType<AbstractTestTask>().configureEach {
+          testLogging {
+              events("failed", "skipped")
+              exceptionFormat = org.gradle.api.tasks.testing.logging.TestExceptionFormat.FULL
+          }
+          val taskPath = path
+          addTestListener(object : TestListener {
+              override fun beforeSuite(suite: TestDescriptor) {}
+              override fun beforeTest(testDescriptor: TestDescriptor) {}
+              override fun afterTest(testDescriptor: TestDescriptor, result: TestResult) {}
+              override fun afterSuite(suite: TestDescriptor, result: TestResult) {
+                  if (suite.parent == null) {
+                      println("$taskPath: ${result.testCount} tests, ${result.failedTestCount} failed, ${result.skippedTestCount} skipped")
+                  }
+              }
+          })
+      }
+  }
+  ```
+
+  An up-to-date test task doesn't run, and prints nothing: `--rerun-tasks` runs it again.
 
 ---
 

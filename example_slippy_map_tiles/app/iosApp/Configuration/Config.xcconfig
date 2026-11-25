@@ -1,0 +1,10 @@
+TEAM_ID=
+
+PRODUCT_NAME=Slippy
+PRODUCT_BUNDLE_IDENTIFIER=org.example.slippy.Slippy$(TEAM_ID)
+
+CURRENT_PROJECT_VERSION=1
+MARKETING_VERSION=0.1.0
+
+// MARKETING_VERSION from slippy.version in gradle.properties, written by the Gradle build
+#include? "Version.xcconfig"

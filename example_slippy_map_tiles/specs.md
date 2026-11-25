@@ -49,8 +49,3 @@ https://mapmath.dev/blog/lat-lon-to-tile-coordinates
 
 The smoke test, and a custom domain.
 
-## Way of working:
-
-- Ask to list its questions before writing any code. 
-- The wizard project is already there
-

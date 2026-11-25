@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>@TITLE@</title>
+    <link type="text/css" rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <div id="composeApplication"></div>
+
+    <!-- The human check (Cloudflare Turnstile): invisible unless the visitor has to tick the box -->
+    <div id="human-check"></div>
+
+    <footer id="android" hidden>
+        Android: <a id="android-link" download>download the app</a> <span id="android-version"></span>
+    </footer>
+
+    <script>
+        // The human check, called from Kotlin (HumanCheck.web.kt): requestHumanCheck() once,
+        // then humanCheckResult() is polled until it is not null.
+        const TURNSTILE_SITE_KEY = "@TURNSTILE_SITE_KEY@";
+        let humanCheckToken = null;
+        let turnstileWidget = null;
+        let turnstileLoading = false;
+
+        function requestHumanCheck() {
+            humanCheckToken = null;
+            if (!TURNSTILE_SITE_KEY) {      // no site key: no check (local development)
+                humanCheckToken = "";
+                return;
+            }
+            // Not just window.turnstile: an element with that id would be a global of that name
+            if (typeof window.turnstile?.render === "function") {
+                renderHumanCheck();
+                return;
+            }
+            if (turnstileLoading) return;
+            // Loaded the first time only, so a visitor who never taps Guest never loads it
+            turnstileLoading = true;
+            const script = document.createElement("script");
+            script.src = "https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit&onload=onTurnstileLoaded";
+            script.async = true;
+            script.onerror = () => {
+                turnstileLoading = false;
+                humanCheckToken = "";
+            };
+            document.head.appendChild(script);
+        }
+
+        function onTurnstileLoaded() {
+            turnstileLoading = false;
+            renderHumanCheck();
+        }
+
+        function renderHumanCheck() {
+            if (turnstileWidget !== null) {
+                // A token is valid once: a new request needs a new one
+                window.turnstile.reset(turnstileWidget);
+                return;
+            }
+            turnstileWidget = window.turnstile.render("#human-check", {
+                sitekey: TURNSTILE_SITE_KEY,
+                appearance: "interaction-only",
+                callback: token => { humanCheckToken = token; },
+                "error-callback": () => { humanCheckToken = ""; },
+                "expired-callback": () => { humanCheckToken = ""; }
+            });
+        }
+
+        // The token; "" without a site key or when Turnstile failed; null while there is none
+        function humanCheckResult() {
+            return humanCheckToken;
+        }
+
+        // The Android APK, when the deploy put one next to the page
+        fetch("android.json")
+            .then(response => response.ok ? response.json() : null)
+            .then(apk => {
+                if (!apk) return;
+                const link = document.getElementById("android-link");
+                link.href = "android/" + apk.file;
+                document.getElementById("android-version").textContent = "(" + apk.version + ")";
+                document.getElementById("android").hidden = false;
+            })
+            .catch(() => {});
+    </script>
+    <script type="application/javascript" src="webApp.js"></script>
+</body>
+</html>
